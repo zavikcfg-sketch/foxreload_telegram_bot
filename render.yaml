@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: foxreload-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FOX_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: FOX_BASE_URL
+        value: https://public-api.foxreload.com
+      - key: FOX_CURRENCY
+        value: usd
+      - key: FOX_LANGUAGE
+        value: ru
+      - key: MARKUP_PERCENT
+        value: "10"
+      - key: STAR_RATE
+        value: "100"
+      - key: DB_PATH
+        value: shop.db
