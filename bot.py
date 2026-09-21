@@ -35,7 +35,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from fastapi import FastAPI, Request, Response
-from yookassa import Configuration, Payment
+from yoomoney import Client as YooMoneyClient, Quickpay
 
 from config import settings
 from pricing import STAR_PACKAGES, PREMIUM_PACKAGES, retail_price
@@ -48,8 +48,7 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-Configuration.account_id = settings.YOOKASSA_SHOP_ID
-Configuration.secret_key = settings.YOOKASSA_SECRET_KEY
+yoomoney_client = YooMoneyClient(settings.YOOMONEY_ACCESS_TOKEN)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "orders.db")
 
@@ -100,13 +99,6 @@ def db_update_order(external_id, **fields):
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         con.execute(f"UPDATE orders SET {set_clause} WHERE external_id = ?", (*fields.values(), external_id))
         con.commit()
-
-
-def db_find_by_yk_payment(payment_id):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
-        row = con.execute("SELECT * FROM orders WHERE yk_payment_id = ?", (payment_id,)).fetchone()
-        return dict(row) if row else None
 
 
 def db_find_by_fireloot_order(order_id):
@@ -289,56 +281,36 @@ async def confirm_and_pay(callback: CallbackQuery, state: FSMContext):
 
     label = f"{amount} Telegram Stars" if kind == "stars" else f"Telegram Premium на {amount} мес."
 
-    payment = Payment.create(
-        {
-            "amount": {"value": f"{price:.2f}", "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{settings.BOT_USERNAME}"},
-            "capture": True,
-            "description": f"{label} для @{username}",
-            "metadata": {"external_id": external_id},
-        },
-        uuid.uuid4().hex,  # idempotence key
+    # label = external_id: по нему бот потом узнаёт этот платёж в истории операций ЮMoney
+    quickpay = Quickpay(
+        receiver=settings.YOOMONEY_WALLET,
+        quickpay_form="shop",
+        targets=f"{label} для @{username}",
+        paymentType="AC",  # оплата картой; можно поставить "PC" для оплаты с кошелька ЮMoney
+        sum=price,
+        label=external_id,
     )
 
     db_create_order(external_id, callback.message.chat.id, kind, amount, username, price)
-    db_update_order(external_id, yk_payment_id=payment.id)
 
-    pay_url = payment.confirmation.confirmation_url
     kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Оплатить", url=pay_url)
+    kb.button(text="💳 Оплатить", url=quickpay.redirected_url)
     kb.adjust(1)
 
     await callback.message.edit_text(
-        f"Счёт создан на {price:.0f} ₽.\nПосле оплаты доставка начнётся автоматически — ничего дополнительно нажимать не нужно.",
+        f"Счёт создан на {price:.0f} ₽.\n"
+        f"После оплаты доставка начнётся автоматически в течение {settings.YOOMONEY_POLL_INTERVAL_SEC}-60 секунд "
+        f"— ничего дополнительно нажимать не нужно.",
         reply_markup=kb.as_markup(),
     )
     await state.clear()
     await callback.answer()
 
 
-# --------------------------------------------------------------------------- #
-# Веб-сервер: вебхуки ЮKassa (оплата прошла) и FireLoot (заказ доставлен)
-# --------------------------------------------------------------------------- #
-app = FastAPI()
-
-
-@app.post("/webhooks/yookassa")
-async def yookassa_webhook(request: Request):
-    event = await request.json()
-    if event.get("event") != "payment.succeeded":
-        return Response(status_code=200)
-
-    payment_obj = event["object"]
-    external_id = payment_obj.get("metadata", {}).get("external_id")
-    if not external_id:
-        return Response(status_code=200)
-
-    order = db_get_order(external_id)
-    if not order or order["status"] != "awaiting_payment":
-        return Response(status_code=200)  # уже обработан или неизвестен
-
+async def _fulfill_paid_order(order: dict):
+    """Общая логика: заказ оплачен → создать заказ в FireLoot → уведомить клиента."""
+    external_id = order["external_id"]
     db_update_order(external_id, status="paid")
-
     try:
         if order["kind"] == "stars":
             result = await fireloot.create_order(external_id, order["target_username"], stars=order["amount"])
@@ -354,11 +326,48 @@ async def yookassa_webhook(request: Request):
             "Оплата прошла, но при передаче заказа поставщику произошла ошибка. "
             "Мы разберёмся и доставим товар вручную либо вернём деньги.",
         )
-        # Сюда же стоит добавить уведомление себе (администратору) — см. settings.ADMIN_CHAT_ID
         if settings.ADMIN_CHAT_ID:
             await bot.send_message(settings.ADMIN_CHAT_ID, f"⚠️ Сбой доставки по заказу {external_id}")
 
-    return Response(status_code=200)
+
+async def poll_yoomoney_payments():
+    """
+    ЮMoney для физлиц без статуса ИП/юрлица не даёт HTTP-уведомления на свой сервер
+    так же просто, как ЮKassa, поэтому бот сам периодически спрашивает историю
+    операций кошелька и ищет платежи с label = external_id наших заказов.
+    """
+    while True:
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as con:
+                con.row_factory = sqlite3.Row
+                pending = con.execute(
+                    "SELECT * FROM orders WHERE status = 'awaiting_payment'"
+                ).fetchall()
+
+            for row in pending:
+                order = dict(row)
+                external_id = order["external_id"]
+                try:
+                    history = yoomoney_client.operation_history(label=external_id, records=5)
+                except Exception:
+                    log.exception("Не удалось получить историю операций ЮMoney")
+                    continue
+
+                for op in history.operations:
+                    if op.label == external_id and op.status == "success" and op.direction == "in":
+                        await _fulfill_paid_order(order)
+                        break
+        except Exception:
+            log.exception("Сбой в цикле опроса ЮMoney")
+
+        await asyncio.sleep(settings.YOOMONEY_POLL_INTERVAL_SEC)
+
+
+# --------------------------------------------------------------------------- #
+# Веб-сервер: вебхук FireLoot (заказ доставлен). Оплата теперь проверяется
+# отдельным фоновым циклом poll_yoomoney_payments(), а не вебхуком.
+# --------------------------------------------------------------------------- #
+app = FastAPI()
 
 
 @app.post("/webhooks/fireloot")
@@ -410,6 +419,7 @@ async def check_balance_and_alert():
 async def run_bot():
     db_init()
     asyncio.create_task(check_balance_and_alert())
+    asyncio.create_task(poll_yoomoney_payments())
     await dp.start_polling(bot)
 
 
